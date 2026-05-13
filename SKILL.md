@@ -50,6 +50,10 @@ AI Agent 自主成长侦察兵。
 
 > 无描述或描述 <10 字符的 Skill 也无法评估，直接排除。
 
+## 运维参考
+
+详见 `references/operations.md`（GitHub 推送、飞书推送机制、常见问题排查）。
+
 ## 使用方式
 
 ### 手动运行
@@ -68,20 +72,7 @@ node ~/.hermes/skills/research/skill-scout/scripts/skill-scout.js --output=~/ski
 node ~/.hermes/skills/research/skill-scout/scripts/skill-scout.js --feishu --quiet
 ```
 
-### 自动运行（Cron Job）
-
-每天 08:00 自动执行并推送飞书：
-
-```bash
-# 创建 Cron Job
-hermes cron create \
-  --name "Skill Scout 每日精选" \
-  --schedule "0 8 * * *" \
-  --prompt "运行 Skill Scout 每日精选报告并推送到飞书。执行：node ~/.hermes/skills/research/skill-scout/scripts/skill-scout.js --feishu --quiet" \
-  --skills "skill-scout"
-```
-
-## 输出示例
+### 输出示例
 
 ```
 ## 🔭 Skill Scout · 每日精选 · 2026-05-13
