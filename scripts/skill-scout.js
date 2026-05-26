@@ -17,7 +17,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
 // ── 参数解析 ────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -43,26 +42,72 @@ function loadHermesIndex() {
 }
 
 // ── 读取已安装的 skill 列表 ─────────────────────────────────────────────
+// 优先用目录扫描（最可靠，不受 CLI 输出截断影响）
+// hermes skills list 表格格式会截断长技能名（如 ai-models-leaderboard → ai-models-leaderboa…）
+// 两层结构：顶层 ~/.hermes/skills/<name>/ 和子目录 ~/.hermes/skills/<category>/<name>/
 function getInstalledSkills() {
   const installed = new Set();
-  try {
-    const out = execSync('hermes skills list', { timeout: 15000, encoding: 'utf8' });
-    for (const line of out.split('\n')) {
-      const m = line.match(/^\s*[-*]?\s*(\S+)/);
-      if (m) installed.add(m[1]);
-    }
-  } catch (e) {
-    // Fallback: scan directory
+
+  function scanDir(dir) {
     try {
-      const files = fs.readdirSync(SKILLS_DIR);
-      for (const f of files) {
-        if (fs.existsSync(path.join(SKILLS_DIR, f, 'SKILL.md'))) {
-          installed.add(f);
-        }
+      const entries = fs.readdirSync(dir);
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            const skillMd = path.join(fullPath, 'SKILL.md');
+            if (fs.existsSync(skillMd)) {
+              // 子目录形式：category/name，直接用目录名作为 skill 名
+              installed.add(entry);
+            } else {
+              // 可能是顶层目录，继续递归
+              scanDir(fullPath);
+            }
+          }
+        } catch (e) { /* ignore */ }
       }
-    } catch (e2) { /* ignore */ }
+    } catch (e) {
+      console.error('⚠️ 目录扫描失败:', e.message);
+    }
   }
+
+  // 扫描顶层（顶层目录本身就是 skill）
+  try {
+    const topEntries = fs.readdirSync(SKILLS_DIR);
+    for (const entry of topEntries) {
+      const skillPath = path.join(SKILLS_DIR, entry, 'SKILL.md');
+      if (fs.existsSync(skillPath)) {
+        installed.add(entry);
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  // 扫描子目录（category/name 结构）
+  scanDir(SKILLS_DIR);
+
   return installed;
+}
+
+// ── 已知持久缺失（official repo:"" + 本地 SKILL.md 不存在）────────────────
+// 这些技能在索引里有，但 hermes skills install 永远报 "Could not fetch"，
+// 因为对应的 SKILL.md 没被打进当前 Hermes 发行版。每天推荐它们只是噪声。
+// 来源：references/known-missing-and-blocked.md（最后核对：2026-05-23）
+// 当上游 Hermes 释出这些 skill 后，从这里移除即可恢复推荐。
+const KNOWN_MISSING = new Set([
+  'official/finance/lbo-model',
+  'official/finance/3-statement-model',
+  'official/finance/pptx-author',
+  'official/finance/comps-analysis',
+  'official/finance/dcf-model',
+  'official/finance/merger-model',
+  'official/finance/excel-author',
+  'official/research/searxng-search',
+]);
+
+function isKnownMissing(skill) {
+  const id = skill.identifier || `${skill.source}/${skill.name}`;
+  return KNOWN_MISSING.has(id);
 }
 
 // ── 边界过滤：排除有问题的 Skill ─────────────────────────────────────────
@@ -220,16 +265,22 @@ function generateReport(allSkills, installed, candidates) {
 
   let md = `## 🔭 Skill Scout · 每日精选 · ${today}\n\n`;
   md += `**目标：找到真正有用的 Skill，不拘来源。**\n`;
-  md += `索引总量 ${allSkills.length} 个 · 已安装 ${installed.size} 个 · ≥5分候选 ${candidates.length} 个\n\n`;
+  md += `索引总量 ${allSkills.length} 个 · 已安装 ${installed.size} 个 · 未安装 ≥5分候选 ${candidates.length} 个\n\n`;
 
-  md += `| # | Skill | 来源 | ⭐ | 简介 |\n`;
-  md += `|---|---|---|---|---|\n`;
+  // 排名图标：前 3 名用奖牌，其余用菱形
+  const rankIcon = (i) => {
+    if (i === 0) return '🥇';
+    if (i === 1) return '🥈';
+    if (i === 2) return '🥉';
+    return '🔹';
+  };
 
   top25.forEach((s, i) => {
-    const d = (s.description || '').replace(/\n/g, ' ').substring(0, 60);
+    const d = (s.description || '').replace(/\n/g, ' ').substring(0, 100);
     const src = sourceLabel(s.source);
     const tags = (s.tags || []).slice(0, 3).join(', ');
-    md += `| ${i+1} | **${s.name}** | ${src} | ${s.score.toFixed(1)}/10 | ${d}${tags ? ` · *${tags}*` : ''} |\n`;
+    md += `${rankIcon(i)} **${i+1}. ${s.name}** · ${src} · 📊 ${s.score.toFixed(1)}/10\n`;
+    md += `   ${d}${tags ? ` · *${tags}*` : ''}\n\n`;
   });
 
   md += `\n---\n`;
@@ -279,22 +330,25 @@ function main() {
   const installed = getInstalledSkills();
   console.log(`📦 已安装: ${installed.size} 个`);
 
-  // ── 过滤 + 评分 + 排序 ─────────────────────────────────────────────────
+// ── 过滤 + 评分 + 排序 ─────────────────────────────────────────────────
   // 第一层：边界过滤（安全底线）
-  // 第二层：描述完整性（没有描述的 Skill 无法评估）
+  // 第二层：描述完整性（无法评估无描述的 Skill）
   // 第三层：去重（同名 Skill 取最高分）
   // 第四层：评分
   // 第五层：阈值筛选
-  const seen = new Set();
-  const candidates = allSkills
-    // 排除已安装
-    .filter(s => !installed.has(s.name))
+  // 第六层：排除已安装（确保 Top 候选全部为未安装状态）
+const seen = new Set();
+  let candidates = allSkills
     // 边界过滤（安全底线）
     .filter(s => !isBlocked(s))
+    // 已知持久缺失（official repo:"" 但本地无 SKILL.md，永远装不上）
+    .filter(s => !isKnownMissing(s))
     // 描述完整性（无法评估无描述的 Skill）
     .filter(s => s.description && s.description.length > 10)
     // 去重
     .filter(s => !seen.has(s.name) && seen.add(s.name))
+    // 排除已安装（在评分前排除，减少不必要的评分计算）
+    .filter(s => !installed.has(s.name))
     // 评分
     .map(s => ({ ...s, score: scoreSkill(s) }))
     // 阈值筛选
@@ -302,7 +356,7 @@ function main() {
     // 排序
     .sort((a, b) => b.score - a.score);
 
-  console.log(`✅ ≥5分候选: ${candidates.length} 个`);
+  console.log(`✅ 未安装 ≥5分候选: ${candidates.length} 个 (已过滤 ${KNOWN_MISSING.size} 个已知缺失)`);
 
   const report = generateReport(allSkills, installed, candidates);
 
